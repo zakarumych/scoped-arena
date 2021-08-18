@@ -1,0 +1,16 @@
+[package]
+name = "scoped-arena"
+version = "0.1.0"
+edition = "2018"
+authors = ["Zakarum <zakarumych@ya.ru>"]
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/scoped-arena"
+homepage = "https://github.com/zakarumych/scoped-arena"
+repository = "https://github.com/zakarumych/scoped-arena"
+readme = "README.md"
+
+
+[features]
+nightly = []
+alloc = []
+default = ["alloc"]
