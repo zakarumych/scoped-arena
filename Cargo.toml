@@ -8,7 +8,9 @@ documentation = "https://docs.rs/scoped-arena"
 homepage = "https://github.com/zakarumych/scoped-arena"
 repository = "https://github.com/zakarumych/scoped-arena"
 readme = "README.md"
-
+description = "Arena allocator with optional scopes"
+categories = ["memory-management", "rust-patterns", "no-std"]
+keywords = ["allocator", "alloc", "arena", "no-std"]
 
 [features]
 nightly = []
