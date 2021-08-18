@@ -22,7 +22,9 @@ jobs:
         profile: minimal
         toolchain: ${{ matrix.rust-toolchain }}
     - name: Run cargo check
-      uses: actions-rs/cargo@v1
-      with:
-        command: check
-        args: --all
+      if: matrix.rust-toolchain != "nightly"
+      run: cargo check --all
+    - name: Run cargo check
+      if: matrix.rust-toolchain == "nightly"
+      run: cargo +nightly check --all --features="nightly"
+
