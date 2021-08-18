@@ -204,7 +204,7 @@ where
     A: Allocator,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Region")
+        f.debug_struct("Scope")
             .field("buckets", &self.buckets)
             .finish_non_exhaustive()
     }
@@ -226,6 +226,13 @@ impl<A> Scope<'_, A>
 where
     A: Allocator,
 {
+    pub fn reset(&mut self) {
+        unsafe {
+            self.drop_list.reset();
+            self.buckets.reset_fork(self.alloc);
+        }
+    }
+
     /// Allocates a block of memory.
     /// Returns a [`NonNull<u8>`] meeting the size and alignment guarantees of layout.
     /// The returned block contents should be considered uninitialized.
@@ -447,7 +454,7 @@ where
     A: Allocator,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ScopeRef")
+        f.debug_struct("ScopeProxy")
             .field("buckets", &self.buckets)
             .finish_non_exhaustive()
     }

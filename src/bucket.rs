@@ -84,7 +84,9 @@ pub struct Buckets<'a> {
 #[cfg(debug_assertions)]
 impl Drop for Buckets<'_> {
     fn drop(&mut self) {
-        assert!(self.tail.get().is_none());
+        if self.parent.is_none() {
+            assert!(self.tail.get().is_none());
+        }
     }
 }
 
@@ -243,18 +245,18 @@ impl Buckets<'_> {
         match self.parent {
             None => unreachable_unchecked(),
             Some(parent) => {
-                if let Some(tail) = parent.tail() {
-                    tail.used = self.parent_tail_used;
-                }
-                parent.last_bucket_layout.set(self.last_bucket_layout.get());
-
                 match self.buckets_added.get() {
-                    0 => {}
+                    0 => {
+                        if let Some(tail) = parent.tail() {
+                            tail.used = self.parent_tail_used;
+                        }
+                    }
                     _ => {
                         match self.tail() {
                             None => unreachable_unchecked(),
                             Some(tail) => {
                                 tail.reset();
+                                let tail_used = tail.used;
                                 let mut excess_bucket = tail.prev;
 
                                 let mut memory_freed = 0;
@@ -275,26 +277,28 @@ impl Buckets<'_> {
 
                                 tail.prev = excess_bucket;
 
+                                let total_memory_usage =
+                                    parent.total_memory_usage.get() + tail.layout.size();
+
                                 debug_assert_eq!(
-                                    tail.layout.size()
-                                        + memory_freed
-                                        + parent.total_memory_usage.get(),
+                                    total_memory_usage + memory_freed,
                                     self.total_memory_usage.get()
                                 );
 
+                                parent.total_memory_usage.set(total_memory_usage);
                                 parent.buckets_added.set(parent.buckets_added.get() + 1);
-                                parent
-                                    .total_memory_usage
-                                    .set(parent.total_memory_usage.get() + tail.layout.size());
+                                parent.last_bucket_layout.set(self.last_bucket_layout.get());
                                 parent.tail.set(Some(NonNull::from(tail)));
+
+                                self.total_memory_usage.set(total_memory_usage);
+                                self.buckets_added.set(0);
+                                self.parent_tail_used = tail_used;
                             }
                         }
                     }
                 }
             }
         }
-
-        self.tail.set(None);
     }
 
     // Flushes buckets added to the fork.
