@@ -1,8 +1,12 @@
+//! Scoped-Arena provides arena-like allocator with optional scopes.
+//! Arena allocators are simple and provides ludicrously fast allocation.
 //!
-//! Scoped-Arena provides arena-like allocator with explicit scopes and ability to drop values allocated on scope and free memory on scope exit.
+//! `Scope` allows storing values. When dropped `Scope` will `Drop` all stored values and free memory allocated by the scope.\
+//! Well placed scopes can significantly reduce memory consumption.\
+//! Creating new scope is cheap and allocating within scope is as fast as allocating parent arena allocator.\
+//! Drop glue is stored in scope only for values that `needs_drop`. i.e. for `Copy` types storing value on scope is simply allocation + copy.
 //!
-//! Supports std collections on nightly.
-//!
+//! Rust borrowing rules require additional layer of `ScopeProxy` to allow references to values on scope and sub-scopes to coexist.
 
 #![no_std]
 #![cfg(any(feature = "nightly", feature = "alloc"))]
