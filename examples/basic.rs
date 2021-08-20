@@ -1,4 +1,4 @@
-use scoped_arena::Arena;
+use scoped_arena::Scope;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Foo(u32);
@@ -10,11 +10,8 @@ impl Drop for Foo {
 }
 
 fn main() {
-    // Creating the arena.
-    let mut arena = Arena::new();
-
     // Creating root scope.
-    let mut scope = arena.scope();
+    let mut scope = Scope::new();
     let mut proxy = scope.proxy();
 
     let value_in_root_scope = proxy.to_scope(Foo(42));
@@ -41,7 +38,6 @@ fn main() {
 
     assert_eq!(slice, &[Foo(100), Foo(101)]);
 
-    drop(scope);
-
-    println!("Total memory usage: {} bytes", arena.total_memory_usage());
+    scope.reset();
+    println!("Total memory usage: {} bytes", scope.total_memory_usage());
 }

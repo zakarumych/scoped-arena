@@ -1,4 +1,4 @@
-use scoped_arena::{Arena, Scope};
+use scoped_arena::Scope;
 
 struct Foo(&'static str);
 
@@ -15,13 +15,9 @@ fn use_scopes(a: &mut Scope, b: &mut Scope, c: &mut Scope) {
 }
 
 fn main() {
-    let mut arena_a = Arena::new();
-    let mut arena_b = Arena::new();
-    let mut arena_c = Arena::new();
-
-    let mut scope_a = arena_a.scope();
-    let mut scope_b = arena_b.scope();
-    let mut scope_c = arena_c.scope();
+    let mut scope_a = Scope::new();
+    let mut scope_b = Scope::new();
+    let mut scope_c = Scope::new();
 
     for i in 0..10 {
         match i % 3 {

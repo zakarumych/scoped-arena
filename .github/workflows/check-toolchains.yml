@@ -22,9 +22,9 @@ jobs:
         profile: minimal
         toolchain: ${{ matrix.rust-toolchain }}
     - name: Run cargo check
-      if: matrix.rust-toolchain != "nightly"
+      if: matrix.rust-toolchain != "allocator_api"
       run: cargo check --all
     - name: Run cargo check
-      if: matrix.rust-toolchain == "nightly"
-      run: cargo +nightly check --all --features="nightly"
+      if: matrix.rust-toolchain == "allocator_api"
+      run: cargo +nightly check --all --features="allocator_api"
 

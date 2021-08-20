@@ -6,7 +6,7 @@ use core::{
     ptr::{write, NonNull},
 };
 
-use crate::stable_alloc::{AllocError, Allocator};
+use crate::allocator_api::{AllocError, Allocator};
 
 struct Bucket {
     prev: Option<NonNull<Self>>,
@@ -81,6 +81,12 @@ pub struct Buckets<'a> {
     parent_tail_used: usize,
 }
 
+/// This type does not automatically implement `Send` because of `NonNull` pointer and reference to Self which is not Sync.
+/// NonNull pointer is tail of the list of allocated buckets owned by the bucket and parent.
+/// When buckets instance with parent is constructed parent is borrowed mutably, so parent cannot be used from another thread.
+/// This also grants exclusive access to the buckets list.
+unsafe impl Send for Buckets<'_> {}
+
 #[cfg(debug_assertions)]
 impl Drop for Buckets<'_> {
     fn drop(&mut self) {
@@ -97,7 +103,7 @@ impl Debug for Buckets<'_> {
             .field("last_bucket_layout", &self.last_bucket_layout.get())
             .field("total_memory_usage", &self.total_memory_usage.get());
 
-        if let Some(parent) = self.parent {
+        if let Some(parent) = &self.parent {
             f.field("parent", &parent)
                 .field("parent_tail_used", &self.parent_tail_used);
         }
@@ -135,54 +141,6 @@ impl Buckets<'static> {
         }
 
         Ok(buckets)
-    }
-}
-
-impl Buckets<'static> {
-    // Resets root bucket list.
-    pub unsafe fn reset<A>(&mut self, alloc: &A, keep_tail: bool)
-    where
-        A: Allocator,
-    {
-        debug_assert!(
-            self.parent.is_none(),
-            "Must be called only on root bucket list owned by `Arena`"
-        );
-
-        let mut tail = self.tail.get();
-        let pre_reset_total_memory_usage = self.total_memory_usage.get();
-
-        if keep_tail {
-            if let Some(mut ptr) = tail {
-                let prev = ptr.as_ref().prev;
-                ptr.as_mut().prev = None;
-                ptr.as_mut().reset();
-                tail = prev;
-
-                self.total_memory_usage.set(ptr.as_ref().layout.size());
-            } else {
-                debug_assert_eq!(self.total_memory_usage.get(), 0);
-            }
-        } else {
-            self.tail.set(None);
-            self.total_memory_usage.set(0);
-        }
-
-        let post_reset_total_memory_usage = self.total_memory_usage.get();
-        let mut memory_freed = 0;
-
-        while let Some(ptr) = tail {
-            let bucket = ptr.as_ref();
-            let layout = bucket.layout;
-            tail = bucket.prev;
-            alloc.deallocate(ptr.cast(), layout);
-            memory_freed += layout.size();
-        }
-
-        debug_assert_eq!(
-            post_reset_total_memory_usage + memory_freed,
-            pre_reset_total_memory_usage
-        );
     }
 }
 
@@ -224,27 +182,59 @@ impl Buckets<'_> {
             tail: Cell::new(self.tail.get()),
             buckets_added: Cell::new(0),
             last_bucket_layout: Cell::new(self.last_bucket_layout.get()),
-            parent: Some(self),
-            parent_tail_used: unsafe { self.tail().map_or(0, |tail| tail.used) },
             total_memory_usage: Cell::new(self.total_memory_usage.get()),
+            parent_tail_used: unsafe { self.tail().map_or(0, |tail| tail.used) },
+            parent: Some(self),
         }
     }
 
     // Resets buckets added to the fork
-    pub unsafe fn reset_fork<A>(&mut self, alloc: &A)
+    pub unsafe fn reset<A>(&mut self, alloc: &A, keep_tail: bool)
     where
         A: Allocator,
     {
         use core::hint::unreachable_unchecked;
 
-        debug_assert!(
-            self.parent.is_some(),
-            "Must be called only on non-root bucket list owned by `Scope`"
-        );
+        match &self.parent {
+            None => {
+                // Resetting root.
+                let mut tail = self.tail.get();
+                let pre_reset_total_memory_usage = self.total_memory_usage.get();
 
-        match self.parent {
-            None => unreachable_unchecked(),
+                if keep_tail {
+                    if let Some(mut ptr) = tail {
+                        let prev = ptr.as_ref().prev;
+                        ptr.as_mut().prev = None;
+                        ptr.as_mut().reset();
+                        tail = prev;
+
+                        self.total_memory_usage.set(ptr.as_ref().layout.size());
+                    } else {
+                        debug_assert_eq!(self.total_memory_usage.get(), 0);
+                    }
+                } else {
+                    self.tail.set(None);
+                    self.total_memory_usage.set(0);
+                }
+
+                let post_reset_total_memory_usage = self.total_memory_usage.get();
+                let mut memory_freed = 0;
+
+                while let Some(ptr) = tail {
+                    let bucket = ptr.as_ref();
+                    let layout = bucket.layout;
+                    tail = bucket.prev;
+                    alloc.deallocate(ptr.cast(), layout);
+                    memory_freed += layout.size();
+                }
+
+                debug_assert_eq!(
+                    post_reset_total_memory_usage + memory_freed,
+                    pre_reset_total_memory_usage
+                );
+            }
             Some(parent) => {
+                // Resetting scoped arena
                 match self.buckets_added.get() {
                     0 => {
                         if let Some(tail) = parent.tail() {
@@ -310,7 +300,7 @@ impl Buckets<'_> {
             "Must be called only on non-root bucket list owned by `Scope`"
         );
 
-        match self.parent {
+        match &self.parent {
             None => unreachable_unchecked(),
             Some(parent) => {
                 parent.tail.set(self.tail.get());
