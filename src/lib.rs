@@ -274,7 +274,20 @@ where
     /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
     pub fn to_scope<T>(&self, value: T) -> &mut T {
-        match self.try_to_scope(value) {
+        self.to_scope_with(|| value)
+    }
+
+    /// Places value returned from function onto the scope.
+    /// Returns mutable reference to value with lifetime equal to scope borrow lifetime.
+    /// Value on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    pub fn to_scope_with<F, T>(&self, f: F) -> &mut T
+    where
+        F: FnOnce() -> T,
+    {
+        match self.try_to_scope_with(f) {
             Ok(value) => value,
             Err(_) => handle_alloc_error(Layout::new::<T>()),
         }
@@ -291,24 +304,42 @@ where
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original value.
     pub fn try_to_scope<T>(&self, value: T) -> Result<&mut T, (AllocError, T)> {
+        self.try_to_scope_with(|| value)
+            .map_err(|(err, f)| (err, f()))
+    }
+
+    /// Tries to place value return from function onto the scope.
+    /// On success, returns mutable reference to value with lifetime equal to scope borrow lifetime.
+    /// Value on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    ///
+    /// # Errors
+    ///
+    /// Returning `Err` indicates that memory is exhausted.
+    /// Returning `Err` contains original value.
+    pub fn try_to_scope_with<F, T>(&self, f: F) -> Result<&mut T, (AllocError, F)>
+    where
+        F: FnOnce() -> T,
+    {
         if needs_drop::<T>() {
             match self.try_alloc(Layout::new::<WithDrop<T>>()) {
                 Ok(ptr) => {
                     let ptr = ptr.cast::<WithDrop<T>>();
 
-                    let value = unsafe { WithDrop::init(ptr, value, &self.drop_list) };
+                    let value = unsafe { WithDrop::init(ptr, f(), &self.drop_list) };
                     Ok(value)
                 }
-                Err(err) => Err((err, value)),
+                Err(err) => Err((err, f)),
             }
         } else {
             match self.try_alloc(Layout::new::<T>()) {
                 Ok(ptr) => {
                     let ptr = ptr.cast::<T>();
-                    unsafe { write(ptr.as_ptr(), value) };
+                    unsafe { write(ptr.as_ptr(), f()) };
                     Ok(unsafe { &mut *ptr.as_ptr() })
                 }
-                Err(err) => Err((err, value)),
+                Err(err) => Err((err, f)),
             }
         }
     }
@@ -525,7 +556,20 @@ where
     /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
     pub fn to_scope<T>(&self, value: T) -> &'scope mut T {
-        match self.try_to_scope(value) {
+        self.to_scope_with(|| value)
+    }
+
+    /// Places value returned from function onto the scope.
+    /// Returns mutable reference to value with lifetime equal to scope borrow lifetime.
+    /// Value on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    pub fn to_scope_with<F, T>(&self, f: F) -> &'scope mut T
+    where
+        F: FnOnce() -> T,
+    {
+        match self.try_to_scope_with(f) {
             Ok(value) => value,
             Err(_) => handle_alloc_error(Layout::new::<T>()),
         }
@@ -542,24 +586,42 @@ where
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original value.
     pub fn try_to_scope<T>(&self, value: T) -> Result<&'scope mut T, (AllocError, T)> {
+        self.try_to_scope_with(|| value)
+            .map_err(|(err, f)| (err, f()))
+    }
+
+    /// Tries to place value return from function onto the scope.
+    /// On success, returns mutable reference to value with lifetime equal to scope borrow lifetime.
+    /// Value on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    ///
+    /// # Errors
+    ///
+    /// Returning `Err` indicates that memory is exhausted.
+    /// Returning `Err` contains original value.
+    pub fn try_to_scope_with<F, T>(&self, f: F) -> Result<&'scope mut T, (AllocError, F)>
+    where
+        F: FnOnce() -> T,
+    {
         if needs_drop::<T>() {
             match self.try_alloc(Layout::new::<WithDrop<T>>()) {
                 Ok(ptr) => {
                     let ptr = ptr.cast::<WithDrop<T>>();
 
-                    let value = unsafe { WithDrop::init(ptr, value, &self.drop_list) };
+                    let value = unsafe { WithDrop::init(ptr, f(), &self.drop_list) };
                     Ok(value)
                 }
-                Err(err) => Err((err, value)),
+                Err(err) => Err((err, f)),
             }
         } else {
             match self.try_alloc(Layout::new::<T>()) {
                 Ok(ptr) => {
                     let ptr = ptr.cast::<T>();
-                    unsafe { write(ptr.as_ptr(), value) };
+                    unsafe { write(ptr.as_ptr(), f()) };
                     Ok(unsafe { &mut *ptr.as_ptr() })
                 }
-                Err(err) => Err((err, value)),
+                Err(err) => Err((err, f)),
             }
         }
     }
