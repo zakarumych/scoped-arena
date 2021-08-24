@@ -2,83 +2,89 @@ use core::{
     alloc::Layout,
     cell::Cell,
     fmt::{self, Debug},
-    mem::{align_of, size_of},
+    mem::{align_of, size_of, MaybeUninit},
     ptr::{write, NonNull},
 };
 
 use crate::allocator_api::{AllocError, Allocator};
 
-struct Bucket {
+struct BucketFooter {
     prev: Option<NonNull<Self>>,
-    used: usize,
-    layout: Layout,
+    start: NonNull<u8>,
+    free_end: usize,
+    size: usize,
 }
 
-impl Debug for Bucket {
+impl Debug for BucketFooter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Bucket")
-            .field("used", &self.used)
-            .field("layout", &self.layout)
+            .field("start", &self.start)
+            .field("size", &self.size)
+            .field("free_end", &self.free_end)
             .finish()
     }
 }
 
-impl Bucket {
-    unsafe fn init<'a>(ptr: NonNull<[u8]>, layout: Layout, list: &Buckets) -> &'a mut Self {
-        debug_assert_eq!(layout.align(), align_of::<Self>());
+impl BucketFooter {
+    unsafe fn init<'a>(ptr: NonNull<[u8]>, list: &Buckets) -> &'a mut Self {
+        let slice = &mut *(ptr.as_ptr() as *mut [MaybeUninit<u8>]);
+        let size = slice.len();
 
-        let ptr = ptr.cast::<Self>();
+        let start = NonNull::new_unchecked(slice.as_mut_ptr().cast::<u8>());
+
+        let cap = (size - size_of::<Self>()) & !(align_of::<Self>() - 1);
+        let end = start.as_ptr() as usize + cap;
+
+        let footer_ptr = start.as_ptr().add(cap).cast::<Self>();
         write(
-            ptr.as_ptr(),
-            Bucket {
+            footer_ptr,
+            BucketFooter {
                 prev: list.tail.get(),
-                used: size_of::<Self>(),
-                layout,
+                start,
+                free_end: end,
+                size,
             },
         );
 
-        list.tail.set(Some(ptr));
+        list.tail.set(Some(NonNull::new_unchecked(footer_ptr)));
         list.buckets_added.set(list.buckets_added.get() + 1);
-        list.last_bucket_layout.set(layout);
+
+        list.last_bucket_size.set(size);
         list.total_memory_usage
-            .set(list.total_memory_usage.get() + layout.size());
+            .set(list.total_memory_usage.get() + size);
 
-        &mut *ptr.as_ptr()
+        &mut *footer_ptr
     }
 
-    fn allocate(&mut self, layout: Layout) -> Option<NonNull<u8>> {
-        let align_mask = layout.align() - 1;
+    #[inline(always)]
+    fn allocate(&mut self, layout: Layout) -> Option<NonNull<[u8]>> {
+        let aligned = self.free_end.checked_sub(layout.size())? & !(layout.align() - 1);
 
-        let start = self as *mut Self as usize + self.used;
-        start.checked_add(align_mask)?;
+        if aligned >= self.start.as_ptr() as usize {
+            let aligned_ptr = aligned as *mut u8;
+            let slice = core::ptr::slice_from_raw_parts_mut(aligned_ptr, self.free_end - aligned);
+            self.free_end = aligned;
 
-        let end = self as *mut Self as usize + self.layout.size();
-        let aligned = (start + align_mask) & (!align_mask);
-
-        aligned.checked_add(layout.size())?;
-
-        if aligned + layout.size() > end {
-            // Exhausted
-            return None;
+            Some(unsafe { NonNull::new_unchecked(slice) })
+        } else {
+            None
         }
-
-        self.used = aligned - self as *mut Self as usize + layout.size();
-
-        Some(unsafe { NonNull::new_unchecked(aligned as *mut u8) })
     }
 
+    #[inline(always)]
     fn reset(&mut self) {
-        self.used = size_of::<Self>();
+        let cap = (self.size - size_of::<Self>()) & !(align_of::<Self>() - 1);
+        self.free_end = self.start.as_ptr() as usize + cap;
     }
 }
 
 pub struct Buckets<'a> {
-    tail: Cell<Option<NonNull<Bucket>>>,
+    tail: Cell<Option<NonNull<BucketFooter>>>,
     buckets_added: Cell<usize>,
-    last_bucket_layout: Cell<Layout>,
+    last_bucket_size: Cell<usize>,
     total_memory_usage: Cell<usize>,
     parent: Option<&'a Buckets<'a>>,
-    parent_tail_used: usize,
+    parent_tail_free_end: usize,
 }
 
 /// This type does not automatically implement `Send` because of `NonNull` pointer and reference to Self which is not Sync.
@@ -100,12 +106,12 @@ impl Debug for Buckets<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut f = f.debug_struct("BucketAlloc");
         f.field("buckets_added", &self.buckets_added.get())
-            .field("last_bucket_layout", &self.last_bucket_layout.get())
+            .field("last_bucket_size", &self.last_bucket_size.get())
             .field("total_memory_usage", &self.total_memory_usage.get());
 
         if let Some(parent) = &self.parent {
             f.field("parent", &parent)
-                .field("parent_tail_used", &self.parent_tail_used);
+                .field("parent_tail_used", &self.parent_tail_free_end);
         }
 
         let mut tail = self.tail.get();
@@ -127,17 +133,17 @@ impl Buckets<'static> {
         let buckets = Buckets {
             tail: Cell::new(None),
             buckets_added: Cell::new(0),
-            last_bucket_layout: Cell::new(layout_with_capacity(0).ok_or(AllocError)?),
+            last_bucket_size: Cell::new(0),
             total_memory_usage: Cell::new(0),
             parent: None,
-            parent_tail_used: 0,
+            parent_tail_free_end: 0,
         };
 
         if capacity != 0 {
             let bucket_layout = layout_with_capacity(capacity).ok_or(AllocError)?;
             let ptr = alloc.allocate(bucket_layout)?;
 
-            unsafe { Bucket::init(ptr, bucket_layout, &buckets) };
+            unsafe { BucketFooter::init(ptr, &buckets) };
         }
 
         Ok(buckets)
@@ -145,12 +151,15 @@ impl Buckets<'static> {
 }
 
 impl Buckets<'_> {
-    pub unsafe fn allocate<A>(&self, layout: Layout, alloc: &A) -> Result<NonNull<u8>, AllocError>
+    pub unsafe fn allocate<A>(&self, layout: Layout, alloc: &A) -> Result<NonNull<[u8]>, AllocError>
     where
         A: Allocator,
     {
         if layout.size() == 0 {
-            return Ok(NonNull::new_unchecked(layout.align() as *mut u8));
+            return Ok(NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
+                layout.align() as *mut u8,
+                0,
+            )));
         }
 
         if let Some(bucket) = self.tail() {
@@ -160,10 +169,10 @@ impl Buckets<'_> {
         }
 
         // Allocate new bucket.
-        let bucket_layout = next_layout(self.last_bucket_layout.get(), layout).ok_or(AllocError)?;
+        let bucket_layout = next_layout(self.last_bucket_size.get(), layout).ok_or(AllocError)?;
         let ptr = alloc.allocate(bucket_layout)?;
-        self.last_bucket_layout.set(bucket_layout);
-        let bucket = Bucket::init(ptr, bucket_layout, self);
+        self.last_bucket_size.set(bucket_layout.size());
+        let bucket = BucketFooter::init(ptr, self);
 
         let ptr = bucket
             .allocate(layout)
@@ -172,7 +181,7 @@ impl Buckets<'_> {
         Ok(ptr)
     }
 
-    unsafe fn tail(&self) -> Option<&mut Bucket> {
+    unsafe fn tail(&self) -> Option<&mut BucketFooter> {
         let ptr = self.tail.get()?;
         Some(&mut *ptr.as_ptr())
     }
@@ -181,9 +190,9 @@ impl Buckets<'_> {
         Buckets {
             tail: Cell::new(self.tail.get()),
             buckets_added: Cell::new(0),
-            last_bucket_layout: Cell::new(self.last_bucket_layout.get()),
+            last_bucket_size: Cell::new(self.last_bucket_size.get()),
             total_memory_usage: Cell::new(self.total_memory_usage.get()),
-            parent_tail_used: unsafe { self.tail().map_or(0, |tail| tail.used) },
+            parent_tail_free_end: unsafe { self.tail().map_or(0, |tail| tail.free_end) },
             parent: Some(self),
         }
     }
@@ -208,7 +217,7 @@ impl Buckets<'_> {
                         ptr.as_mut().reset();
                         tail = prev;
 
-                        self.total_memory_usage.set(ptr.as_ref().layout.size());
+                        self.total_memory_usage.set(ptr.as_ref().size);
                     } else {
                         debug_assert_eq!(self.total_memory_usage.get(), 0);
                     }
@@ -222,9 +231,10 @@ impl Buckets<'_> {
 
                 while let Some(ptr) = tail {
                     let bucket = ptr.as_ref();
-                    let layout = bucket.layout;
+                    let layout =
+                        Layout::from_size_align_unchecked(bucket.size, align_of::<BucketFooter>());
                     tail = bucket.prev;
-                    alloc.deallocate(ptr.cast(), layout);
+                    alloc.deallocate(bucket.start, layout);
                     memory_freed += layout.size();
                 }
 
@@ -238,7 +248,7 @@ impl Buckets<'_> {
                 match self.buckets_added.get() {
                     0 => {
                         if let Some(tail) = parent.tail() {
-                            tail.used = self.parent_tail_used;
+                            tail.free_end = self.parent_tail_free_end;
                         }
                     }
                     _ => {
@@ -246,7 +256,6 @@ impl Buckets<'_> {
                             None => unreachable_unchecked(),
                             Some(tail) => {
                                 tail.reset();
-                                let tail_used = tail.used;
                                 let mut excess_bucket = tail.prev;
 
                                 let mut memory_freed = 0;
@@ -257,18 +266,22 @@ impl Buckets<'_> {
                                         None => unreachable_unchecked(),
                                         Some(ptr) => {
                                             let bucket = ptr.as_ref();
-                                            let layout = bucket.layout;
+                                            let layout = Layout::from_size_align_unchecked(
+                                                bucket.size,
+                                                align_of::<BucketFooter>(),
+                                            );
                                             excess_bucket = bucket.prev;
-                                            alloc.deallocate(ptr.cast(), layout);
+                                            alloc.deallocate(bucket.start, layout);
                                             memory_freed += layout.size();
                                         }
                                     }
                                 }
 
                                 tail.prev = excess_bucket;
+                                let tail_free_end = tail.free_end;
 
                                 let total_memory_usage =
-                                    parent.total_memory_usage.get() + tail.layout.size();
+                                    parent.total_memory_usage.get() + tail.size;
 
                                 debug_assert_eq!(
                                     total_memory_usage + memory_freed,
@@ -277,12 +290,12 @@ impl Buckets<'_> {
 
                                 parent.total_memory_usage.set(total_memory_usage);
                                 parent.buckets_added.set(parent.buckets_added.get() + 1);
-                                parent.last_bucket_layout.set(self.last_bucket_layout.get());
+                                parent.last_bucket_size.set(self.last_bucket_size.get());
                                 parent.tail.set(Some(NonNull::from(tail)));
 
                                 self.total_memory_usage.set(total_memory_usage);
                                 self.buckets_added.set(0);
-                                self.parent_tail_used = tail_used;
+                                self.parent_tail_free_end = tail_free_end;
                             }
                         }
                     }
@@ -307,7 +320,7 @@ impl Buckets<'_> {
                 parent
                     .buckets_added
                     .set(parent.buckets_added.get() + self.buckets_added.get());
-                parent.last_bucket_layout.set(self.last_bucket_layout.get());
+                parent.last_bucket_size.set(self.last_bucket_size.get());
                 parent.total_memory_usage.set(self.total_memory_usage.get());
             }
         }
@@ -321,21 +334,29 @@ impl Buckets<'_> {
 }
 
 fn layout_with_capacity(capacity: usize) -> Option<Layout> {
-    let (layout, _) = Layout::new::<Bucket>()
+    let (layout, _) = Layout::new::<BucketFooter>()
         .extend(Layout::array::<u8>(capacity).ok()?)
         .ok()?;
     Some(layout)
 }
 
-fn next_layout(last_layout: Layout, item_layout: Layout) -> Option<Layout> {
-    const MIN_BUCKET_CAPACITY: usize = 128;
+fn next_layout(last_size: usize, item_layout: Layout) -> Option<Layout> {
+    const ALIGN: usize = 1 + ((align_of::<BucketFooter>() - 1) | 7);
+    const SOFT_MAX_GROW: usize = 1 + (((1 << 12) - 1) | (ALIGN - 1));
+    const FOOTER_OVERHEAD: usize = size_of::<BucketFooter>() + ALIGN;
+    const MIN_CAP: usize = 32;
 
-    let last_capacity = last_layout.size() - size_of::<Bucket>();
+    let min_grow = (item_layout.size() + item_layout.align() - 1)
+        .max(MIN_CAP)
+        .checked_add(FOOTER_OVERHEAD)?;
+    let grow = last_size.min(SOFT_MAX_GROW).max(min_grow);
+    let size = last_size.checked_add(grow)?;
 
-    let new_capacity = last_capacity
-        .checked_add(last_capacity.max(item_layout.size()))?
-        .max(MIN_BUCKET_CAPACITY);
+    let aligned_size = if size > SOFT_MAX_GROW {
+        size.checked_add(SOFT_MAX_GROW - 1)? & !(SOFT_MAX_GROW - 1)
+    } else {
+        size.checked_add(ALIGN - 1)? & !(ALIGN - 1)
+    };
 
-    let new_align = last_layout.align();
-    Layout::from_size_align(new_capacity + size_of::<Bucket>(), new_align).ok()
+    Layout::from_size_align(aligned_size, ALIGN).ok()
 }

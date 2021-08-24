@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2021-08-24
+
+### Changed
+- Switched direction of memory block consumption
+- Scope can allocate more memory than requested due to alignment
+
 ## [0.2.1] - 2021-08-22
 
 ### Added

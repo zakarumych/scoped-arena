@@ -247,7 +247,7 @@ where
     ///
     /// Returned block will be deallocated when scope is dropped.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
-    pub fn alloc(&self, layout: Layout) -> NonNull<u8> {
+    pub fn alloc(&self, layout: Layout) -> NonNull<[u8]> {
         match self.try_alloc(layout) {
             Ok(ptr) => ptr,
             Err(_) => handle_alloc_error(layout),
@@ -263,7 +263,7 @@ where
     /// # Errors
     ///
     /// Returning `Err` indicates that memory is exhausted.
-    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe { self.buckets.allocate(layout, &self.alloc) }
     }
 
@@ -529,7 +529,7 @@ where
     ///
     /// Returned block will be deallocated when scope is dropped.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
-    pub fn alloc(&self, layout: Layout) -> NonNull<u8> {
+    pub fn alloc(&self, layout: Layout) -> NonNull<[u8]> {
         match self.try_alloc(layout) {
             Ok(ptr) => ptr,
             Err(_) => handle_alloc_error(layout),
@@ -545,7 +545,7 @@ where
     /// # Errors
     ///
     /// Returning `Err` indicates that memory is exhausted.
-    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe { self.buckets.allocate(layout, &self.alloc) }
     }
 
@@ -763,12 +763,7 @@ where
     A: Allocator,
 {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let ptr = self.try_alloc(layout)?;
-        let slice = unsafe {
-            // `ScopeProxy` always allocates exact amount of bytes.
-            NonNull::new_unchecked(core::slice::from_raw_parts_mut(ptr.as_ptr(), layout.size()))
-        };
-        Ok(slice)
+        self.try_alloc(layout)
     }
 
     unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
@@ -802,12 +797,7 @@ where
     A: Allocator,
 {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let ptr = self.try_alloc(layout)?;
-        let slice = unsafe {
-            // `ScopeProxy` always allocates exact amount of bytes.
-            NonNull::new_unchecked(core::slice::from_raw_parts_mut(ptr.as_ptr(), layout.size()))
-        };
-        Ok(slice)
+        self.try_alloc(layout)
     }
 
     unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
