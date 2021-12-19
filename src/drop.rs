@@ -104,13 +104,15 @@ impl Drop for DropList<'_> {
 }
 
 impl DropList<'static> {
-    pub fn new() -> Self {
+    #[inline(always)]
+    pub const fn new() -> Self {
         DropList {
             tail: Cell::new(None),
             parent: None,
         }
     }
 
+    #[inline(always)]
     pub fn fork<'a>(&'a mut self) -> DropList<'a> {
         DropList {
             tail: Cell::new(self.tail.get()),
@@ -118,6 +120,7 @@ impl DropList<'static> {
         }
     }
 
+    #[inline(always)]
     pub unsafe fn reset(&mut self) {
         debug_assert!(self.parent.is_none());
 
@@ -134,6 +137,7 @@ impl DropList<'static> {
 
 impl DropList<'_> {
     // Flushes drops added to the fork.
+    #[inline(always)]
     pub unsafe fn flush_fork(&mut self) {
         use core::hint::unreachable_unchecked;
 

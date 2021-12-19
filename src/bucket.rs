@@ -20,7 +20,8 @@ impl Debug for BucketFooter {
         f.debug_struct("Bucket")
             .field("start", &self.start)
             .field("size", &self.size)
-            .field("free_end", &self.free_end)
+            .field("free_end", &(self.free_end as *mut u8))
+            .field("free", &(self.free_end - self.start.as_ptr() as usize))
             .finish()
     }
 }
@@ -151,6 +152,7 @@ impl Buckets<'static> {
 }
 
 impl Buckets<'_> {
+    #[inline(always)]
     pub unsafe fn allocate<A>(&self, layout: Layout, alloc: &A) -> Result<NonNull<[u8]>, AllocError>
     where
         A: Allocator,
@@ -186,6 +188,7 @@ impl Buckets<'_> {
         Some(&mut *ptr.as_ptr())
     }
 
+    #[inline(always)]
     pub fn fork<'a>(&'a mut self) -> Buckets<'a> {
         Buckets {
             tail: Cell::new(self.tail.get()),
@@ -198,6 +201,7 @@ impl Buckets<'_> {
     }
 
     // Resets buckets added to the fork
+    #[inline(always)]
     pub unsafe fn reset<A>(&mut self, alloc: &A, keep_tail: bool)
     where
         A: Allocator,
@@ -305,6 +309,7 @@ impl Buckets<'_> {
     }
 
     // Flushes buckets added to the fork.
+    #[inline(always)]
     pub unsafe fn flush_fork(&mut self) {
         use core::hint::unreachable_unchecked;
 
@@ -328,6 +333,7 @@ impl Buckets<'_> {
         self.tail.set(None);
     }
 
+    #[inline(always)]
     pub fn total_memory_usage(&self) -> usize {
         self.total_memory_usage.get()
     }
@@ -342,18 +348,18 @@ fn layout_with_capacity(capacity: usize) -> Option<Layout> {
 
 fn next_layout(last_size: usize, item_layout: Layout) -> Option<Layout> {
     const ALIGN: usize = 1 + ((align_of::<BucketFooter>() - 1) | 7);
-    const SOFT_MAX_GROW: usize = 1 + (((1 << 12) - 1) | (ALIGN - 1));
+    const BIG_ALIGN: usize = 1 + (((1 << 12) - 1) | (ALIGN - 1));
     const FOOTER_OVERHEAD: usize = size_of::<BucketFooter>() + ALIGN;
     const MIN_CAP: usize = 32;
 
     let min_grow = (item_layout.size() + item_layout.align() - 1)
         .max(MIN_CAP)
         .checked_add(FOOTER_OVERHEAD)?;
-    let grow = last_size.min(SOFT_MAX_GROW).max(min_grow);
+    let grow = last_size.max(min_grow);
     let size = last_size.checked_add(grow)?;
 
-    let aligned_size = if size > SOFT_MAX_GROW {
-        size.checked_add(SOFT_MAX_GROW - 1)? & !(SOFT_MAX_GROW - 1)
+    let aligned_size = if size > BIG_ALIGN {
+        size.checked_add(BIG_ALIGN - 1)? & !(BIG_ALIGN - 1)
     } else {
         size.checked_add(ALIGN - 1)? & !(ALIGN - 1)
     };

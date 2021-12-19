@@ -119,7 +119,7 @@
 //! This method is especially useful to deal with API that requires slices (*glares at FFI*), collecting into temporary `Vec` would cost much more.
 //!
 
-#![no_std]
+// #![no_std]
 #![cfg(any(feature = "allocator_api", feature = "alloc"))]
 #![cfg_attr(feature = "allocator_api", feature(allocator_api))]
 
@@ -188,6 +188,7 @@ impl<A> Drop for Scope<'_, A>
 where
     A: Allocator,
 {
+    #[inline(always)]
     fn drop(&mut self) {
         unsafe {
             self.drop_list.reset();
@@ -199,12 +200,14 @@ where
 #[cfg(feature = "alloc")]
 impl Scope<'_, Global> {
     /// Returns new instance of arena allocator based on [`Global`] allocator.
+    #[inline(always)]
     pub fn new() -> Self {
         Scope::new_in(Global)
     }
 
     /// Returns new instance of arena allocator based on [`Global`] allocator
     /// with preallocated capacity in bytes.
+    #[inline(always)]
     pub fn with_capacity(capacity: usize) -> Self {
         Scope::with_capacity_in(capacity, Global)
     }
@@ -215,12 +218,14 @@ where
     A: Allocator,
 {
     /// Returns new instance of arena allocator based on provided allocator.
+    #[inline(always)]
     pub fn new_in(alloc: A) -> Self {
         Scope::with_capacity_in(0, alloc)
     }
 
     /// Returns new instance of arena allocator based on provided allocator
     /// with preallocated capacity in bytes.
+    #[inline(always)]
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
         Scope {
             buckets: Buckets::new(capacity, &alloc).expect(ALLOCATOR_CAPACITY_OVERFLOW),
@@ -234,6 +239,7 @@ impl<A> Scope<'_, A>
 where
     A: Allocator,
 {
+    #[inline(always)]
     pub fn reset(&mut self) {
         unsafe {
             self.drop_list.reset();
@@ -247,6 +253,7 @@ where
     ///
     /// Returned block will be deallocated when scope is dropped.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn alloc(&self, layout: Layout) -> NonNull<[u8]> {
         match self.try_alloc(layout) {
             Ok(ptr) => ptr,
@@ -263,6 +270,7 @@ where
     /// # Errors
     ///
     /// Returning `Err` indicates that memory is exhausted.
+    #[inline(always)]
     pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe { self.buckets.allocate(layout, &self.alloc) }
     }
@@ -273,6 +281,7 @@ where
     ///
     /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn to_scope<T>(&self, value: T) -> &mut T {
         self.to_scope_with(|| value)
     }
@@ -283,6 +292,7 @@ where
     ///
     /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn to_scope_with<F, T>(&self, f: F) -> &mut T
     where
         F: FnOnce() -> T,
@@ -303,6 +313,7 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original value.
+    #[inline(always)]
     pub fn try_to_scope<T>(&self, value: T) -> Result<&mut T, (AllocError, T)> {
         self.try_to_scope_with(|| value)
             .map_err(|(err, f)| (err, f()))
@@ -318,6 +329,7 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original value.
+    #[inline(always)]
     pub fn try_to_scope_with<F, T>(&self, f: F) -> Result<&mut T, (AllocError, F)>
     where
         F: FnOnce() -> T,
@@ -354,6 +366,7 @@ where
     /// It will not consume more items.
     /// This method will always fail for unbound iterators.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn to_scope_from_iter<T, I>(&self, iter: I) -> &mut [T]
     where
         I: IntoIterator<Item = T>,
@@ -391,6 +404,7 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original iterator.
+    #[inline(always)]
     pub fn try_to_scope_from_iter<T, I>(
         &self,
         iter: I,
@@ -442,6 +456,7 @@ where
     }
 
     /// Reports total memory allocated from underlying allocator by associated arena.
+    #[inline(always)]
     pub fn total_memory_usage(&self) -> usize {
         self.buckets.total_memory_usage()
     }
@@ -449,6 +464,7 @@ where
     /// Creates scope proxy bound to the scope.
     /// Any objects allocated through proxy will be attached to the scope.
     /// Returned proxy will use reference to the underlying allocator.
+    #[inline(always)]
     pub fn proxy_ref(&mut self) -> ScopeProxy<'_, &'_ A> {
         ScopeProxy {
             buckets: self.buckets.fork(),
@@ -465,6 +481,7 @@ where
     /// Creates scope proxy bound to the scope.
     /// Any objects allocated through proxy will be attached to the scope.
     /// Returned proxy will use clone of the underlying allocator.
+    #[inline(always)]
     pub fn proxy(&mut self) -> ScopeProxy<'_, A> {
         ScopeProxy {
             buckets: self.buckets.fork(),
@@ -511,6 +528,7 @@ impl<A> Drop for ScopeProxy<'_, A>
 where
     A: Allocator,
 {
+    #[inline(always)]
     fn drop(&mut self) {
         unsafe {
             self.drop_list.flush_fork();
@@ -529,6 +547,7 @@ where
     ///
     /// Returned block will be deallocated when scope is dropped.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn alloc(&self, layout: Layout) -> NonNull<[u8]> {
         match self.try_alloc(layout) {
             Ok(ptr) => ptr,
@@ -545,6 +564,7 @@ where
     /// # Errors
     ///
     /// Returning `Err` indicates that memory is exhausted.
+    #[inline(always)]
     pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe { self.buckets.allocate(layout, &self.alloc) }
     }
@@ -555,6 +575,7 @@ where
     ///
     /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn to_scope<T>(&self, value: T) -> &'scope mut T {
         self.to_scope_with(|| value)
     }
@@ -565,6 +586,7 @@ where
     ///
     /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn to_scope_with<F, T>(&self, f: F) -> &'scope mut T
     where
         F: FnOnce() -> T,
@@ -585,6 +607,7 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original value.
+    #[inline(always)]
     pub fn try_to_scope<T>(&self, value: T) -> Result<&'scope mut T, (AllocError, T)> {
         self.try_to_scope_with(|| value)
             .map_err(|(err, f)| (err, f()))
@@ -600,6 +623,7 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original value.
+    #[inline(always)]
     pub fn try_to_scope_with<F, T>(&self, f: F) -> Result<&'scope mut T, (AllocError, F)>
     where
         F: FnOnce() -> T,
@@ -636,6 +660,7 @@ where
     /// It will not consume more items.
     /// This method will always fail for unbound iterators.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
     pub fn to_scope_from_iter<T, I>(&self, iter: I) -> &'scope mut [T]
     where
         I: IntoIterator<Item = T>,
@@ -673,6 +698,7 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     /// Returning `Err` contains original iterator.
+    #[inline(always)]
     pub fn try_to_scope_from_iter<T, I>(
         &self,
         iter: I,
@@ -724,6 +750,7 @@ where
     }
 
     /// Reports total memory allocated from underlying allocator by associated arena.
+    #[inline(always)]
     pub fn total_memory_usage(&self) -> usize {
         self.buckets.total_memory_usage()
     }
@@ -731,6 +758,7 @@ where
     /// Creates new scope which inherits from the proxy's scope.
     /// This scope becomes locked until returned scope is dropped.
     /// Returned scope will use reference to the underlying allocator.
+    #[inline(always)]
     pub fn scope_ref(&mut self) -> Scope<'_, &'_ A> {
         Scope {
             buckets: self.buckets.fork(),
@@ -747,6 +775,7 @@ where
     /// Creates new scope which inherits from the proxy's scope.
     /// This scope becomes locked until returned scope is dropped.
     /// Returned scope will use clone of the underlying allocator.
+    #[inline(always)]
     pub fn scope(&mut self) -> Scope<'_, A> {
         Scope {
             buckets: self.buckets.fork(),
@@ -762,15 +791,18 @@ unsafe impl<A> Allocator for &'_ Scope<'_, A>
 where
     A: Allocator,
 {
+    #[inline(always)]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.try_alloc(layout)
     }
 
+    #[inline(always)]
     unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
         // Will be deallocated on scope drop.
     }
 
     #[cfg(feature = "allocator_api")]
+    #[inline(always)]
     unsafe fn shrink(
         &self,
         ptr: NonNull<u8>,
@@ -796,15 +828,18 @@ unsafe impl<A> Allocator for ScopeProxy<'_, A>
 where
     A: Allocator,
 {
+    #[inline(always)]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.try_alloc(layout)
     }
 
+    #[inline(always)]
     unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {
         // Will be deallocated on scope drop.
     }
 
     #[cfg(feature = "allocator_api")]
+    #[inline(always)]
     unsafe fn shrink(
         &self,
         ptr: NonNull<u8>,

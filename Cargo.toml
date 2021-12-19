@@ -16,3 +16,16 @@ keywords = ["allocator", "alloc", "arena", "no-std"]
 allocator_api = []
 alloc = []
 default = ["alloc"]
+
+[dev-dependencies]
+quickcheck = "1.0"
+criterion = "0.3.0"
+rand = "0.8"
+lazy_static = "1.0"
+bumpalo = { version = "3.7", features = ["allocator_api"] }
+
+[[bench]]
+name = "benches"
+path = "benches/bench.rs"
+harness = false
+required-features = ["allocator_api"]
