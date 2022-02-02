@@ -151,22 +151,31 @@ impl Buckets<'static> {
     }
 }
 
-impl Buckets<'_> {
+impl<'a> Buckets<'a> {
+    /// # Safety
+    ///
+    /// At least one clone of `alloc` must live for `'a`
     #[inline(always)]
-    pub unsafe fn allocate<A>(&self, layout: Layout, alloc: &A) -> Result<NonNull<[u8]>, AllocError>
+    pub unsafe fn allocate<A>(
+        &self,
+        layout: Layout,
+        alloc: &A,
+    ) -> Result<&'a mut [MaybeUninit<u8>], AllocError>
     where
         A: Allocator,
     {
         if layout.size() == 0 {
-            return Ok(NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
-                layout.align() as *mut u8,
+            return Ok(core::slice::from_raw_parts_mut(
+                layout.align() as *mut MaybeUninit<u8>,
                 0,
-            )));
+            ));
         }
 
         if let Some(bucket) = self.tail() {
             if let Some(ptr) = bucket.allocate(layout) {
-                return Ok(ptr);
+                let mut ptr = NonNull::new_unchecked(ptr.as_ptr() as *mut [MaybeUninit<u8>]);
+                let slice = ptr.as_mut();
+                return Ok(slice);
             }
         }
 
@@ -180,7 +189,10 @@ impl Buckets<'_> {
             .allocate(layout)
             .expect("Allocation from new bucket must succeed");
 
-        Ok(ptr)
+        let mut ptr = NonNull::new_unchecked(ptr.as_ptr() as *mut [MaybeUninit<u8>]);
+        let slice = ptr.as_mut();
+
+        Ok(slice)
     }
 
     unsafe fn tail(&self) -> Option<&mut BucketFooter> {
@@ -189,7 +201,7 @@ impl Buckets<'_> {
     }
 
     #[inline(always)]
-    pub fn fork<'a>(&'a mut self) -> Buckets<'a> {
+    pub fn fork(&mut self) -> Buckets<'_> {
         Buckets {
             tail: Cell::new(self.tail.get()),
             buckets_added: Cell::new(0),

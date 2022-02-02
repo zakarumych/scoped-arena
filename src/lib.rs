@@ -119,7 +119,7 @@
 //! This method is especially useful to deal with API that requires slices (*glares at FFI*), collecting into temporary `Vec` would cost much more.
 //!
 
-// #![no_std]
+#![no_std]
 #![cfg(any(feature = "allocator_api", feature = "alloc"))]
 #![cfg_attr(feature = "allocator_api", feature(allocator_api))]
 
@@ -134,8 +134,9 @@ use core::{
     alloc::Layout,
     fmt::{self, Debug},
     iter::IntoIterator,
-    mem::needs_drop,
-    ptr::{write, NonNull},
+    mem::{align_of, needs_drop, MaybeUninit},
+    ptr::{self, write, NonNull},
+    slice,
 };
 
 #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
@@ -248,22 +249,22 @@ where
     }
 
     /// Allocates a block of memory.
-    /// Returns a [`NonNull<u8>`] meeting the size and alignment guarantees of layout.
-    /// The returned block contents should be considered uninitialized.
+    /// Returns a [`&mut [MaybeUninit<u8>]`] meeting the size and alignment guarantees of layout.
+    /// The returned block should be initialized before use.
     ///
     /// Returned block will be deallocated when scope is dropped.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
     #[inline(always)]
-    pub fn alloc(&self, layout: Layout) -> NonNull<[u8]> {
+    pub fn alloc(&self, layout: Layout) -> &mut [MaybeUninit<u8>] {
         match self.try_alloc(layout) {
-            Ok(ptr) => ptr,
+            Ok(buf) => buf,
             Err(_) => handle_alloc_error(layout),
         }
     }
 
     /// Attempts to allocate a block of memory.
-    /// On success, returns a [`NonNull<u8>`] meeting the size and alignment guarantees of layout.
-    /// The returned block contents should be considered uninitialized.
+    /// On success, returns a [`&mut [MaybeUninit<u8>]`] meeting the size and alignment guarantees of layout.
+    /// The returned block should be initialized before use.
     ///
     /// Returned block will be deallocated when scope is dropped.
     ///
@@ -271,8 +272,46 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     #[inline(always)]
-    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+    pub fn try_alloc(&self, layout: Layout) -> Result<&mut [MaybeUninit<u8>], AllocError> {
         unsafe { self.buckets.allocate(layout, &self.alloc) }
+    }
+
+    /// Allocates a block of memory.
+    /// Returns a [`&mut [u8]`] meeting the size and alignment guarantees of layout.
+    /// The returned block contents is zero-initialized.
+    ///
+    /// Returned block will be deallocated when scope is dropped.
+    #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
+    pub fn alloc_zeroed(&self, layout: Layout) -> &mut [u8] {
+        match self.try_alloc_zeroed(layout) {
+            Ok(buf) => buf,
+            Err(_) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Attempts to allocate a block of memory.
+    /// On success, returns a [`&mut [u8]`] meeting the size and alignment guarantees of layout.
+    /// The returned block contents is zero-initialized.
+    ///
+    /// Returned block will be deallocated when scope is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returning `Err` indicates that memory is exhausted.
+    #[inline(always)]
+    pub fn try_alloc_zeroed(&self, layout: Layout) -> Result<&mut [u8], AllocError> {
+        let buf = unsafe { self.buckets.allocate(layout, &self.alloc) }?;
+
+        let buf = unsafe {
+            // Zeroing bytes buffer should be safe.
+            ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
+
+            // Zero-initialized.
+            slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+        };
+
+        Ok(buf)
     }
 
     /// Move value onto the scope.
@@ -334,26 +373,7 @@ where
     where
         F: FnOnce() -> T,
     {
-        if needs_drop::<T>() {
-            match self.try_alloc(Layout::new::<WithDrop<T>>()) {
-                Ok(ptr) => {
-                    let ptr = ptr.cast::<WithDrop<T>>();
-
-                    let value = unsafe { WithDrop::init(ptr, f(), &self.drop_list) };
-                    Ok(value)
-                }
-                Err(err) => Err((err, f)),
-            }
-        } else {
-            match self.try_alloc(Layout::new::<T>()) {
-                Ok(ptr) => {
-                    let ptr = ptr.cast::<T>();
-                    unsafe { write(ptr.as_ptr(), f()) };
-                    Ok(unsafe { &mut *ptr.as_ptr() })
-                }
-                Err(err) => Err((err, f)),
-            }
-        }
+        try_to_scope_with(|layout| self.try_alloc(layout), &self.drop_list, f)
     }
 
     /// Move values from iterator onto the scope.
@@ -371,8 +391,6 @@ where
     where
         I: IntoIterator<Item = T>,
     {
-        use core::mem::align_of;
-
         let too_large_layout = unsafe {
             Layout::from_size_align_unchecked(usize::MAX - align_of::<T>(), align_of::<T>())
         };
@@ -412,47 +430,73 @@ where
     where
         I: IntoIterator<Item = T>,
     {
-        let iter = iter.into_iter();
-        let upper_bound = match iter.size_hint().1 {
-            Some(upper_bound) => upper_bound,
-            None => return Err((AllocError, iter)),
+        try_to_scope_from_iter(|layout| self.try_alloc(layout), &self.drop_list, iter)
+    }
+
+    /// Put multiple clones of the value onto the scope.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn to_scope_many<T>(&self, count: usize, value: T) -> &mut [T]
+    where
+        T: Clone,
+    {
+        let too_large_layout = unsafe {
+            Layout::from_size_align_unchecked(usize::MAX - align_of::<T>(), align_of::<T>())
         };
-
-        if needs_drop::<T>() {
-            match WithDrop::<T>::array_layout(upper_bound) {
-                Some(layout) => match self.try_alloc(layout) {
-                    Ok(ptr) => {
-                        let ptr = ptr.cast::<WithDrop<T>>();
-                        let slice = unsafe { WithDrop::init_array(ptr, iter, &self.drop_list) };
-                        Ok(slice)
-                    }
-                    Err(err) => Err((err, iter)),
-                },
-                None => Err((AllocError, iter)),
-            }
-        } else {
-            match Layout::array::<T>(upper_bound) {
-                Ok(layout) => match self.try_alloc(layout) {
-                    Ok(ptr) => {
-                        let ptr = ptr.cast::<T>();
-
-                        let mut item_count = 0;
-                        unsafe {
-                            for item in iter.take(upper_bound) {
-                                write(ptr.as_ptr().add(item_count), item);
-                                item_count += 1;
-                            }
-                        }
-
-                        let slice =
-                            unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), item_count) };
-                        Ok(&mut *slice)
-                    }
-                    Err(err) => Err((err, iter)),
-                },
-                Err(_) => Err((AllocError, iter)),
-            }
+        match self.try_to_scope_many(count, value) {
+            Ok(slice) => slice,
+            Err(_) => handle_alloc_error(Layout::array::<T>(count).unwrap_or(too_large_layout)),
         }
+    }
+
+    /// Tries to put multiple clones of the value onto the scope.
+    /// On success, returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn try_to_scope_many<T>(&self, count: usize, value: T) -> Result<&mut [T], AllocError>
+    where
+        T: Clone,
+    {
+        self.try_to_scope_many_with(count, || value.clone())
+    }
+
+    /// Put multiple values created by calls to the specified function onto the scope.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn to_scope_many_with<T, F>(&self, count: usize, f: F) -> &mut [T]
+    where
+        F: FnMut() -> T,
+    {
+        let too_large_layout = unsafe {
+            Layout::from_size_align_unchecked(usize::MAX - align_of::<T>(), align_of::<T>())
+        };
+        match self.try_to_scope_many_with(count, f) {
+            Ok(slice) => slice,
+            Err(_) => handle_alloc_error(Layout::array::<T>(count).unwrap_or(too_large_layout)),
+        }
+    }
+
+    /// Tries to put multiple values created by calls to the specified function onto the scope.
+    /// On success, returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn try_to_scope_many_with<T, F>(&self, count: usize, f: F) -> Result<&mut [T], AllocError>
+    where
+        F: FnMut() -> T,
+    {
+        try_to_scope_many_with(|layout| self.try_alloc(layout), &self.drop_list, count, f)
     }
 
     /// Reports total memory allocated from underlying allocator by associated arena.
@@ -465,7 +509,7 @@ where
     /// Any objects allocated through proxy will be attached to the scope.
     /// Returned proxy will use reference to the underlying allocator.
     #[inline(always)]
-    pub fn proxy_ref(&mut self) -> ScopeProxy<'_, &'_ A> {
+    pub fn proxy_ref<'a>(&'a mut self) -> ScopeProxy<'a, &'a A> {
         ScopeProxy {
             buckets: self.buckets.fork(),
             alloc: &self.alloc,
@@ -482,7 +526,7 @@ where
     /// Any objects allocated through proxy will be attached to the scope.
     /// Returned proxy will use clone of the underlying allocator.
     #[inline(always)]
-    pub fn proxy(&mut self) -> ScopeProxy<'_, A> {
+    pub fn proxy<'a>(&'a mut self) -> ScopeProxy<'a, A> {
         ScopeProxy {
             buckets: self.buckets.fork(),
             alloc: self.alloc.clone(),
@@ -542,22 +586,22 @@ where
     A: Allocator,
 {
     /// Allocates a block of memory.
-    /// Returns a [`NonNull<u8>`] meeting the size and alignment guarantees of layout.
-    /// The returned block contents should be considered uninitialized.
+    /// Returns a [`&mut [MaybeUninit<u8>]`] meeting the size and alignment guarantees of layout.
+    /// The returned block should be initialized before use.
     ///
     /// Returned block will be deallocated when scope is dropped.
     #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
     #[inline(always)]
-    pub fn alloc(&self, layout: Layout) -> NonNull<[u8]> {
+    pub fn alloc(&self, layout: Layout) -> &'scope mut [MaybeUninit<u8>] {
         match self.try_alloc(layout) {
-            Ok(ptr) => ptr,
+            Ok(buf) => buf,
             Err(_) => handle_alloc_error(layout),
         }
     }
 
     /// Attempts to allocate a block of memory.
-    /// On success, returns a [`NonNull<u8>`] meeting the size and alignment guarantees of layout.
-    /// The returned block contents should be considered uninitialized.
+    /// On success, returns a [`&mut [MaybeUninit<u8>]`] meeting the size and alignment guarantees of layout.
+    /// The returned block should be initialized before use.
     ///
     /// Returned block will be deallocated when scope is dropped.
     ///
@@ -565,8 +609,46 @@ where
     ///
     /// Returning `Err` indicates that memory is exhausted.
     #[inline(always)]
-    pub fn try_alloc(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+    pub fn try_alloc(&self, layout: Layout) -> Result<&'scope mut [MaybeUninit<u8>], AllocError> {
         unsafe { self.buckets.allocate(layout, &self.alloc) }
+    }
+
+    /// Allocates a block of memory.
+    /// Returns a [`&mut [u8]`] meeting the size and alignment guarantees of layout.
+    /// The returned block contents is zero-initialized.
+    ///
+    /// Returned block will be deallocated when scope is dropped.
+    #[cfg(all(not(no_global_oom_handling), feature = "alloc"))]
+    #[inline(always)]
+    pub fn alloc_zeroed(&self, layout: Layout) -> &mut [u8] {
+        match self.try_alloc_zeroed(layout) {
+            Ok(buf) => buf,
+            Err(_) => handle_alloc_error(layout),
+        }
+    }
+
+    /// Attempts to allocate a block of memory.
+    /// On success, returns a [`&mut [u8]`] meeting the size and alignment guarantees of layout.
+    /// The returned block contents is zero-initialized.
+    ///
+    /// Returned block will be deallocated when scope is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returning `Err` indicates that memory is exhausted.
+    #[inline(always)]
+    pub fn try_alloc_zeroed(&self, layout: Layout) -> Result<&mut [u8], AllocError> {
+        let buf = unsafe { self.buckets.allocate(layout, &self.alloc) }?;
+
+        let buf = unsafe {
+            // Zeroing bytes buffer should be safe.
+            ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
+
+            // Zero-initialized.
+            slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len())
+        };
+
+        Ok(buf)
     }
 
     /// Move value onto the scope.
@@ -628,26 +710,7 @@ where
     where
         F: FnOnce() -> T,
     {
-        if needs_drop::<T>() {
-            match self.try_alloc(Layout::new::<WithDrop<T>>()) {
-                Ok(ptr) => {
-                    let ptr = ptr.cast::<WithDrop<T>>();
-
-                    let value = unsafe { WithDrop::init(ptr, f(), &self.drop_list) };
-                    Ok(value)
-                }
-                Err(err) => Err((err, f)),
-            }
-        } else {
-            match self.try_alloc(Layout::new::<T>()) {
-                Ok(ptr) => {
-                    let ptr = ptr.cast::<T>();
-                    unsafe { write(ptr.as_ptr(), f()) };
-                    Ok(unsafe { &mut *ptr.as_ptr() })
-                }
-                Err(err) => Err((err, f)),
-            }
-        }
+        try_to_scope_with(|layout| self.try_alloc(layout), &self.drop_list, f)
     }
 
     /// Move values from iterator onto the scope.
@@ -665,8 +728,6 @@ where
     where
         I: IntoIterator<Item = T>,
     {
-        use core::mem::align_of;
-
         let too_large_layout = unsafe {
             Layout::from_size_align_unchecked(usize::MAX - align_of::<T>(), align_of::<T>())
         };
@@ -706,47 +767,81 @@ where
     where
         I: IntoIterator<Item = T>,
     {
-        let iter = iter.into_iter();
-        let upper_bound = match iter.size_hint().1 {
-            Some(upper_bound) => upper_bound,
-            None => return Err((AllocError, iter)),
+        try_to_scope_from_iter(|layout| self.try_alloc(layout), &self.drop_list, iter)
+    }
+
+    /// Put multiple clones of the value onto the scope.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn to_scope_many<T>(&self, count: usize, value: T) -> &'scope mut [T]
+    where
+        T: Clone,
+    {
+        let too_large_layout = unsafe {
+            Layout::from_size_align_unchecked(usize::MAX - align_of::<T>(), align_of::<T>())
         };
-
-        if needs_drop::<T>() {
-            match WithDrop::<T>::array_layout(upper_bound) {
-                Some(layout) => match self.try_alloc(layout) {
-                    Ok(ptr) => {
-                        let ptr = ptr.cast::<WithDrop<T>>();
-                        let slice = unsafe { WithDrop::init_array(ptr, iter, &self.drop_list) };
-                        Ok(slice)
-                    }
-                    Err(err) => Err((err, iter)),
-                },
-                None => Err((AllocError, iter)),
-            }
-        } else {
-            match Layout::array::<T>(upper_bound) {
-                Ok(layout) => match self.try_alloc(layout) {
-                    Ok(ptr) => {
-                        let ptr = ptr.cast::<T>();
-
-                        let mut item_count = 0;
-                        unsafe {
-                            for item in iter.take(upper_bound) {
-                                write(ptr.as_ptr().add(item_count), item);
-                                item_count += 1;
-                            }
-                        }
-
-                        let slice =
-                            unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), item_count) };
-                        Ok(&mut *slice)
-                    }
-                    Err(err) => Err((err, iter)),
-                },
-                Err(_) => Err((AllocError, iter)),
-            }
+        match self.try_to_scope_many(count, value) {
+            Ok(slice) => slice,
+            Err(_) => handle_alloc_error(Layout::array::<T>(count).unwrap_or(too_large_layout)),
         }
+    }
+
+    /// Tries to put multiple clones of the value onto the scope.
+    /// On success, returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn try_to_scope_many<T>(
+        &self,
+        count: usize,
+        value: T,
+    ) -> Result<&'scope mut [T], AllocError>
+    where
+        T: Clone,
+    {
+        self.try_to_scope_many_with(count, || value.clone())
+    }
+
+    /// Put multiple values created by calls to the specified function onto the scope.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn to_scope_many_with<T, F>(&self, count: usize, f: F) -> &'scope mut [T]
+    where
+        F: FnMut() -> T,
+    {
+        let too_large_layout = unsafe {
+            Layout::from_size_align_unchecked(usize::MAX - align_of::<T>(), align_of::<T>())
+        };
+        match self.try_to_scope_many_with(count, f) {
+            Ok(slice) => slice,
+            Err(_) => handle_alloc_error(Layout::array::<T>(count).unwrap_or(too_large_layout)),
+        }
+    }
+
+    /// Tries to put multiple values created by calls to the specified function onto the scope.
+    /// On success, returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Returns mutable reference to slice with lifetime equal to scope borrow lifetime.
+    /// Values on scope will be dropped when scope is dropped.
+    ///
+    /// This method is as cheap as allocation if value does not needs dropping as reported by [`core::mem::needs_drop`].
+    #[inline(always)]
+    pub fn try_to_scope_many_with<T, F>(
+        &self,
+        count: usize,
+        f: F,
+    ) -> Result<&'scope mut [T], AllocError>
+    where
+        F: FnMut() -> T,
+    {
+        try_to_scope_many_with(|layout| self.try_alloc(layout), &self.drop_list, count, f)
     }
 
     /// Reports total memory allocated from underlying allocator by associated arena.
@@ -759,7 +854,7 @@ where
     /// This scope becomes locked until returned scope is dropped.
     /// Returned scope will use reference to the underlying allocator.
     #[inline(always)]
-    pub fn scope_ref(&mut self) -> Scope<'_, &'_ A> {
+    pub fn scope_ref<'a>(&'a mut self) -> Scope<'a, &'a A> {
         Scope {
             buckets: self.buckets.fork(),
             alloc: &self.alloc,
@@ -776,7 +871,7 @@ where
     /// This scope becomes locked until returned scope is dropped.
     /// Returned scope will use clone of the underlying allocator.
     #[inline(always)]
-    pub fn scope(&mut self) -> Scope<'_, A> {
+    pub fn scope<'a>(&'a mut self) -> Scope<'a, A> {
         Scope {
             buckets: self.buckets.fork(),
             alloc: self.alloc.clone(),
@@ -793,7 +888,14 @@ where
 {
     #[inline(always)]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.try_alloc(layout)
+        let buf = self.try_alloc(layout)?;
+        let ptr = unsafe {
+            NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
+                buf.as_mut_ptr() as *mut u8,
+                buf.len(),
+            ))
+        };
+        Ok(ptr)
     }
 
     #[inline(always)]
@@ -830,7 +932,14 @@ where
 {
     #[inline(always)]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.try_alloc(layout)
+        let buf = self.try_alloc(layout)?;
+        let ptr = unsafe {
+            NonNull::new_unchecked(core::ptr::slice_from_raw_parts_mut(
+                buf.as_mut_ptr() as *mut u8,
+                buf.len(),
+            ))
+        };
+        Ok(ptr)
     }
 
     #[inline(always)]
@@ -859,4 +968,147 @@ where
             old_layout.size(),
         )))
     }
+}
+
+#[inline(always)]
+fn try_to_scope_with<'a, F, T>(
+    try_alloc: impl FnOnce(Layout) -> Result<&'a mut [MaybeUninit<u8>], AllocError>,
+    drop_list: &DropList,
+    f: F,
+) -> Result<&'a mut T, (AllocError, F)>
+where
+    F: FnOnce() -> T,
+{
+    if needs_drop::<T>() {
+        match try_alloc(Layout::new::<WithDrop<T>>()) {
+            Ok(buf) => {
+                let value = unsafe { WithDrop::init(buf, f(), drop_list) };
+                Ok(value)
+            }
+            Err(err) => Err((err, f)),
+        }
+    } else {
+        match try_alloc(Layout::new::<T>()) {
+            Ok(buf) => {
+                let uninit = unsafe { cast_buf(buf) };
+                unsafe { write(uninit.as_mut_ptr(), f()) };
+                Ok(unsafe { uninit.assume_init_mut() })
+            }
+            Err(err) => Err((err, f)),
+        }
+    }
+}
+
+fn try_to_scope_from_iter<'a, T, I>(
+    try_alloc: impl FnOnce(Layout) -> Result<&'a mut [MaybeUninit<u8>], AllocError>,
+    drop_list: &DropList,
+    iter: I,
+) -> Result<&'a mut [T], (AllocError, I::IntoIter)>
+where
+    I: IntoIterator<Item = T>,
+{
+    let iter = iter.into_iter();
+    let upper_bound = match iter.size_hint().1 {
+        Some(upper_bound) => upper_bound,
+        None => return Err((AllocError, iter)),
+    };
+
+    if needs_drop::<T>() {
+        match WithDrop::<T>::array_layout(upper_bound) {
+            Some(layout) => match try_alloc(layout) {
+                Ok(buf) => {
+                    let slice = unsafe { WithDrop::init_iter(buf, iter, drop_list) };
+                    Ok(slice)
+                }
+                Err(err) => Err((err, iter)),
+            },
+            None => Err((AllocError, iter)),
+        }
+    } else {
+        match Layout::array::<T>(upper_bound) {
+            Ok(layout) => match try_alloc(layout) {
+                Ok(buf) => {
+                    let (uninit, _) = unsafe {
+                        // Buffer with layout for `[T; upper_bound]` was requested.
+                        cast_buf_array::<T>(buf)
+                    };
+
+                    let item_count = iter.take(uninit.len()).fold(0, |idx, item| {
+                        uninit[idx].write(item);
+                        idx + 1
+                    });
+
+                    let slice = unsafe {
+                        // First `item_count` elements of the array were initialized from iterator
+                        core::slice::from_raw_parts_mut(uninit.as_mut_ptr() as *mut T, item_count)
+                    };
+                    Ok(slice)
+                }
+                Err(err) => Err((err, iter)),
+            },
+            Err(_) => Err((AllocError, iter)),
+        }
+    }
+}
+
+fn try_to_scope_many_with<'a, T>(
+    try_alloc: impl FnOnce(Layout) -> Result<&'a mut [MaybeUninit<u8>], AllocError>,
+    drop_list: &DropList,
+    count: usize,
+    mut f: impl FnMut() -> T,
+) -> Result<&'a mut [T], AllocError> {
+    if needs_drop::<T>() {
+        match WithDrop::<T>::array_layout(count) {
+            Some(layout) => match try_alloc(layout) {
+                Ok(buf) => {
+                    let slice = unsafe { WithDrop::init_many(buf, count, f, drop_list) };
+                    Ok(slice)
+                }
+                Err(err) => Err(err),
+            },
+            None => Err(AllocError),
+        }
+    } else {
+        match Layout::array::<T>(count) {
+            Ok(layout) => match try_alloc(layout) {
+                Ok(buf) => {
+                    let (uninit, _) = unsafe {
+                        // Buffer with layout for `[T; upper_bound]` was requested.
+                        cast_buf_array::<T>(buf)
+                    };
+
+                    for i in 0..count {
+                        uninit[i].write(f());
+                    }
+
+                    let slice = unsafe {
+                        // First `item_count` elements of the array were initialized from iterator
+                        core::slice::from_raw_parts_mut(uninit.as_mut_ptr() as *mut T, count)
+                    };
+                    Ok(slice)
+                }
+                Err(err) => Err(err),
+            },
+            Err(_) => Err(AllocError),
+        }
+    }
+}
+
+unsafe fn cast_buf<T>(buf: &mut [MaybeUninit<u8>]) -> &mut MaybeUninit<T> {
+    let layout = Layout::new::<T>();
+    debug_assert_eq!(0, buf.as_mut_ptr() as usize % layout.align());
+    debug_assert_eq!(buf.len(), layout.size());
+    &mut *(buf.as_mut_ptr() as *mut MaybeUninit<T>)
+}
+
+unsafe fn cast_buf_array<T>(
+    buf: &mut [MaybeUninit<u8>],
+) -> (&mut [MaybeUninit<T>], &mut [MaybeUninit<u8>]) {
+    let layout = Layout::new::<T>();
+    debug_assert_eq!(0, buf.as_mut_ptr() as usize % layout.align());
+    let len = buf.len() / layout.size();
+
+    let (head, tail) = buf.split_at_mut(len * layout.size());
+    let head = slice::from_raw_parts_mut(head.as_mut_ptr() as *mut MaybeUninit<T>, len);
+    (head, tail)
 }

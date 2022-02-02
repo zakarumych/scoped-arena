@@ -1,9 +1,11 @@
 use core::{
     alloc::Layout,
     cell::Cell,
-    mem::{needs_drop, ManuallyDrop},
-    ptr::{drop_in_place, write, NonNull},
+    mem::{needs_drop, size_of, ManuallyDrop, MaybeUninit},
+    ptr::{drop_in_place, NonNull},
 };
+
+use crate::{cast_buf, cast_buf_array};
 
 #[repr(C)]
 pub struct WithDrop<T> {
@@ -12,24 +14,25 @@ pub struct WithDrop<T> {
 }
 
 impl<T> WithDrop<T> {
-    pub unsafe fn init<'a>(ptr: NonNull<Self>, value: T, drop_list: &DropList) -> &'a mut T {
+    pub unsafe fn init<'a>(
+        uninit: &'a mut [MaybeUninit<u8>],
+        value: T,
+        drop_list: &DropList,
+    ) -> &'a mut T {
         debug_assert!(needs_drop::<T>());
+        let uninit = cast_buf::<WithDrop<T>>(&mut uninit[..size_of::<Self>()]);
 
-        // Pointer is expected to suitable for `WithDrop<T>`.
-        write(
-            ptr.as_ptr(),
-            WithDrop {
-                to_drop: ToDrop {
-                    prev: drop_list.tail.get(),
-                    count: 1,
-                    drop: |_, _| {},
-                },
-                value: ManuallyDrop::new(value),
+        uninit.write(WithDrop {
+            to_drop: ToDrop {
+                prev: drop_list.tail.get(),
+                count: 1,
+                drop: |_, _| {},
             },
-        );
+            value: ManuallyDrop::new(value),
+        });
 
         // Now initialized.
-        let with_drop = &mut *ptr.as_ptr();
+        let with_drop = uninit.assume_init_mut();
 
         // Setup drop glue.
         with_drop.to_drop.drop = drop_glue::<T>;
@@ -50,35 +53,29 @@ impl<T> WithDrop<T> {
         )
     }
 
-    pub unsafe fn init_array<'a>(
-        ptr: NonNull<Self>,
+    pub unsafe fn init_iter<'a>(
+        uninit: &'a mut [MaybeUninit<u8>],
         iter: impl Iterator<Item = T>,
         drop_list: &DropList,
     ) -> &'a mut [T] {
         debug_assert!(needs_drop::<T>());
 
-        let to_drop_ptr = ptr.as_ptr().cast::<ToDrop>();
+        let (_, values_offset) = Layout::new::<ToDrop>().extend(Layout::new::<T>()).unwrap();
+        let (to_drop_uninit, values_uninit) = uninit.split_at_mut(values_offset);
 
-        write(
-            to_drop_ptr,
-            ToDrop {
-                prev: drop_list.tail.get(),
-                count: 0,
-                drop: |_, _| {},
-            },
-        );
+        let to_drop_uninit = cast_buf::<ToDrop>(&mut to_drop_uninit[..size_of::<ToDrop>()]);
+        let to_drop = to_drop_uninit.write(ToDrop {
+            prev: drop_list.tail.get(),
+            count: 0,
+            drop: |_, _| {},
+        });
 
-        let items_start_ptr = to_drop_ptr.add(1).cast::<T>();
+        let (values_uninit, _) = cast_buf_array::<T>(values_uninit);
 
-        let upper_bound = iter.size_hint().1.unwrap();
-        let mut item_count = 0;
-        for item in iter.take(upper_bound) {
-            write(items_start_ptr.add(item_count), item);
-            item_count += 1;
-        }
-
-        // Now initialized.
-        let to_drop = &mut *to_drop_ptr;
+        let item_count = iter.take(values_uninit.len()).fold(0, |idx, item| {
+            values_uninit[idx].write(item);
+            idx + 1
+        });
 
         // Setup drop glue.
         to_drop.drop = drop_glue::<T>;
@@ -86,8 +83,41 @@ impl<T> WithDrop<T> {
 
         drop_list.tail.set(Some(NonNull::from(to_drop)));
 
-        let slice = core::slice::from_raw_parts_mut(items_start_ptr, item_count);
-        &mut *slice
+        core::slice::from_raw_parts_mut(values_uninit.as_mut_ptr() as *mut T, item_count)
+    }
+
+    pub unsafe fn init_many<'a>(
+        uninit: &'a mut [MaybeUninit<u8>],
+        count: usize,
+        mut f: impl FnMut() -> T,
+        drop_list: &DropList,
+    ) -> &'a mut [T] {
+        debug_assert!(needs_drop::<T>());
+
+        let (_, values_offset) = Layout::new::<ToDrop>().extend(Layout::new::<T>()).unwrap();
+        let (to_drop_uninit, values_uninit) = uninit.split_at_mut(values_offset);
+
+        let to_drop_uninit = cast_buf::<ToDrop>(&mut to_drop_uninit[..size_of::<ToDrop>()]);
+        let to_drop = to_drop_uninit.write(ToDrop {
+            prev: drop_list.tail.get(),
+            count: 0,
+            drop: |_, _| {},
+        });
+
+        let (values_uninit, _) = cast_buf_array::<T>(values_uninit);
+        let values_uninit = &mut values_uninit[..count];
+
+        for i in 0..count {
+            values_uninit[i].write(f());
+        }
+
+        // Setup drop glue.
+        to_drop.drop = drop_glue::<T>;
+        to_drop.count = count;
+
+        drop_list.tail.set(Some(NonNull::from(to_drop)));
+
+        core::slice::from_raw_parts_mut(values_uninit.as_mut_ptr() as *mut T, count)
     }
 }
 
