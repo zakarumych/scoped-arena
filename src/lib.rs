@@ -250,6 +250,7 @@ where
 
     /// Allocates a block of memory.
     /// Returns a [`&mut [MaybeUninit<u8>]`] meeting the size and alignment guarantees of layout.
+    /// Actual size of the returned size MAY be larger than requested.
     /// The returned block should be initialized before use.
     ///
     /// Returned block will be deallocated when scope is dropped.
@@ -264,6 +265,7 @@ where
 
     /// Attempts to allocate a block of memory.
     /// On success, returns a [`&mut [MaybeUninit<u8>]`] meeting the size and alignment guarantees of layout.
+    /// Actual size of the returned size MAY be larger than requested.
     /// The returned block should be initialized before use.
     ///
     /// Returned block will be deallocated when scope is dropped.
@@ -278,6 +280,7 @@ where
 
     /// Allocates a block of memory.
     /// Returns a [`&mut [u8]`] meeting the size and alignment guarantees of layout.
+    /// Actual size of the returned size MAY be larger than requested.
     /// The returned block contents is zero-initialized.
     ///
     /// Returned block will be deallocated when scope is dropped.
@@ -292,6 +295,7 @@ where
 
     /// Attempts to allocate a block of memory.
     /// On success, returns a [`&mut [u8]`] meeting the size and alignment guarantees of layout.
+    /// Actual size of the returned size MAY be larger than requested.
     /// The returned block contents is zero-initialized.
     ///
     /// Returned block will be deallocated when scope is dropped.
@@ -1097,7 +1101,7 @@ fn try_to_scope_many_with<'a, T>(
 unsafe fn cast_buf<T>(buf: &mut [MaybeUninit<u8>]) -> &mut MaybeUninit<T> {
     let layout = Layout::new::<T>();
     debug_assert_eq!(0, buf.as_mut_ptr() as usize % layout.align());
-    debug_assert_eq!(buf.len(), layout.size());
+    debug_assert!(buf.len() >= layout.size());
     &mut *(buf.as_mut_ptr() as *mut MaybeUninit<T>)
 }
 
