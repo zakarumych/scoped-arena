@@ -1116,3 +1116,32 @@ unsafe fn cast_buf_array<T>(
     let head = slice::from_raw_parts_mut(head.as_mut_ptr() as *mut MaybeUninit<T>, len);
     (head, tail)
 }
+
+/// An extension trait that provides a postfix version of `Scope::to_scope_from_iter`.
+/// This may lead to more readable code in some instances.
+pub trait CollectIntoScope<T> {
+    /// A posfix version of `Scope::to_scope_from_iter`.
+    /// Analogous to `Iterator::collect`.
+    /// # Examples
+    /// ```rust
+    /// use scoped_arena::Scope;
+    /// use scoped_arena::CollectIntoScope;
+    ///
+    /// let scope = Scope::new();
+    ///
+    /// let a = [1, 2, 3];
+    ///
+    /// let doubled: &[i32] = a.iter().map(|&x| x * 2).collect_into_scope(&scope);
+    ///
+    /// assert_eq!(&[2, 4, 6], doubled);
+    /// ```
+    #[allow(clippy::mut_from_ref)]
+    fn collect_into_scope<'a>(self, scope: &'a Scope<'a>) -> &'a mut [T];
+}
+
+impl<I: IntoIterator> CollectIntoScope<I::Item> for I {
+    #[inline(always)]
+    fn collect_into_scope<'a>(self, scope: &'a Scope<'a>) -> &'a mut [I::Item] {
+        scope.to_scope_from_iter(self)
+    }
+}
