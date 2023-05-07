@@ -214,6 +214,12 @@ impl Scope<'_, Global> {
     }
 }
 
+impl Default for Scope<'_, Global> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<A> Scope<'_, A>
 where
     A: Allocator,
